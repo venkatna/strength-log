@@ -2,6 +2,8 @@
   "use strict";
 
   const STORAGE_KEY = "strength-log-data-v1";
+  const PIN_KEY = "strength-log-pin-v1";
+  const UNLOCK_KEY = "strength-log-unlocked";
   const tabs = [
     { id: "today", label: "Today", icon: "◆" },
     { id: "history", label: "History", icon: "↺" },
@@ -66,6 +68,7 @@
 
   let data = loadData();
   let view = { tab: "today", expandedHistoryId: null, editingHistoryId: null, editingRoutineId: null };
+  let authMode = getPinRecord() ? (sessionStorage.getItem(UNLOCK_KEY) ? null : "unlock") : "setup";
   let toastTimer;
 
   function createId(prefix) {
@@ -135,6 +138,30 @@
 
   function saveData() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }
+
+  function getPinRecord() {
+    try {
+      const value = localStorage.getItem(PIN_KEY);
+      return value ? JSON.parse(value) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function bytesToBase64(bytes) {
+    return btoa(String.fromCharCode(...bytes));
+  }
+
+  async function hashPin(pin, salt) {
+    const content = new TextEncoder().encode(`${salt}:${pin}`);
+    const digest = await crypto.subtle.digest("SHA-256", content);
+    return bytesToBase64(new Uint8Array(digest));
+  }
+
+  async function createPinRecord(pin) {
+    const salt = bytesToBase64(crypto.getRandomValues(new Uint8Array(16)));
+    return { salt, hash: await hashPin(pin, salt) };
   }
 
   function escapeHtml(value) {
@@ -366,7 +393,48 @@
           ${subtitle ? `<p class="eyebrow">${escapeHtml(subtitle)}</p>` : ""}
           <h1>${escapeHtml(title)}</h1>
         </div>
+        ${getPinRecord() ? '<button class="icon-button" aria-label="Lock app" data-action="lock">⌾</button>' : ""}
       </header>
+    `;
+  }
+
+  function renderPinGate() {
+    const changing = authMode === "change";
+    const creating = authMode === "setup" || changing;
+    const title = changing ? "Change PIN" : creating ? "Protect Strength Log" : "Unlock Strength Log";
+    const action = creating ? "Save PIN" : "Unlock";
+
+    return `
+      <main class="app-shell auth-shell">
+        <section class="card auth-card">
+          <p class="eyebrow">${creating ? "Device protection" : "Welcome back"}</p>
+          <h1>${title}</h1>
+          <p class="muted">
+            ${creating
+              ? "Choose a 4–8 digit PIN. It protects this browser’s workout data from casual access."
+              : "Enter your PIN to access the workout data stored on this device."}
+          </p>
+          <form class="stack" data-pin-form>
+            <label class="field">
+              <span class="field-label">${creating ? "New PIN" : "PIN"}</span>
+              <input class="pin-input" name="pin" type="password" inputmode="numeric" pattern="[0-9]*"
+                minlength="4" maxlength="8" autocomplete="${creating ? "new-password" : "current-password"}" required autofocus>
+            </label>
+            ${creating ? `
+              <label class="field">
+                <span class="field-label">Confirm PIN</span>
+                <input class="pin-input" name="confirmation" type="password" inputmode="numeric" pattern="[0-9]*"
+                  minlength="4" maxlength="8" autocomplete="new-password" required>
+              </label>
+            ` : ""}
+            <button class="primary full" type="submit">${action}</button>
+            ${changing ? '<button class="secondary full" type="button" data-action="cancel-pin-change">Cancel</button>' : ""}
+          </form>
+          <p class="install-note muted pin-warning">
+            This is a local app lock, not website access control. Other people can still load the public site and create their own separate PIN.
+          </p>
+        </section>
+      </main>
     `;
   }
 
@@ -642,6 +710,14 @@
           <input id="import-file" type="file" accept="application/json,.json" data-action="import" hidden>
         </label>
       </section>
+      <section class="card">
+        <h2>App lock</h2>
+        <p class="muted">Change or remove the PIN stored on this device.</p>
+        <div class="two-columns">
+          <button class="secondary" data-action="change-pin">Change PIN</button>
+          <button class="danger" data-action="remove-pin">Remove PIN</button>
+        </div>
+      </section>
       <section class="card install-note">
         <strong>Storage note</strong>
         <p class="muted">Safari can remove website data in some circumstances. Export a backup periodically until cloud sync is added.</p>
@@ -650,6 +726,11 @@
   }
 
   function render() {
+    if (authMode) {
+      document.querySelector("#app").innerHTML = renderPinGate();
+      return;
+    }
+
     const content = data.activeWorkout
       ? renderActiveWorkout()
       : {
@@ -744,6 +825,22 @@
     if (action === "tab") {
       view.tab = target.dataset.tab;
       render();
+    } else if (action === "lock") {
+      sessionStorage.removeItem(UNLOCK_KEY);
+      authMode = "unlock";
+      render();
+    } else if (action === "change-pin") {
+      authMode = "change";
+      render();
+    } else if (action === "cancel-pin-change") {
+      authMode = null;
+      render();
+    } else if (action === "remove-pin") {
+      if (!window.confirm("Remove the PIN from this device?")) return;
+      localStorage.removeItem(PIN_KEY);
+      sessionStorage.removeItem(UNLOCK_KEY);
+      showToast("PIN removed.");
+      render();
     } else if (action === "start") {
       startWorkout(target.dataset.routineId);
     } else if (action === "toggle-set") {
@@ -811,6 +908,38 @@
     } else if (action === "import" && target.files?.[0]) {
       importData(target.files[0]);
     }
+  });
+
+  document.addEventListener("submit", async event => {
+    const form = event.target.closest("[data-pin-form]");
+    if (!form) return;
+    event.preventDefault();
+
+    const formData = new FormData(form);
+    const pin = String(formData.get("pin") || "");
+    if (!/^\d{4,8}$/.test(pin)) {
+      showToast("Use a 4–8 digit PIN.");
+      return;
+    }
+
+    if (authMode === "unlock") {
+      const record = getPinRecord();
+      if (!record || await hashPin(pin, record.salt) !== record.hash) {
+        showToast("Incorrect PIN.");
+        form.reset();
+        return;
+      }
+    } else {
+      if (pin !== String(formData.get("confirmation") || "")) {
+        showToast("PINs do not match.");
+        return;
+      }
+      localStorage.setItem(PIN_KEY, JSON.stringify(await createPinRecord(pin)));
+    }
+
+    sessionStorage.setItem(UNLOCK_KEY, "true");
+    authMode = null;
+    render();
   });
 
   if ("serviceWorker" in navigator) {
